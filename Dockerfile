@@ -13,12 +13,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY src/ ./src/
 COPY data/raw/ ./data/raw/
 COPY eval/ ./eval/
-
-RUN python -m src.ingest data/raw && python -m src.index
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()" || exit 1
 
-CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["/entrypoint.sh"]
