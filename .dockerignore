@@ -1,0 +1,13 @@
+venv/
+.env
+__pycache__/
+*.pyc
+.DS_Store
+data/processed/
+*.index
+*.faiss
+.pytest_cache/
+.ipynb_checkpoints/
+.git/
+.gitignore
+tests/

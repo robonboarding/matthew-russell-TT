@@ -50,46 +50,75 @@ Chosen because:
 
 ## How to run
 
+### Local (venv)
+
 ```bash
-# Setup
 python3.11 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # add Azure OpenAI credentials
+cp .env.example .env   # add Azure OpenAI credentials; optional API_KEY
 
-# Index the corpus
 python -m src.ingest data/raw
 python -m src.index
-
-# CLI
 python -m src.generate "What role did CDOs play in the 2008 crisis?"
 
-# API
-uvicorn src.api:app --reload --port 8000
-# Swagger UI at http://localhost:8000/docs
-
-# Evaluate
-python -m src.evaluate eval/qa_pairs.json
+uvicorn src.api:app --reload --port 8000           # Swagger at /docs
+python -m src.evaluate eval/qa_pairs.json          # run eval harness
+python -m src.compare_retrieval eval/qa_pairs.json # MMR on vs off
+pytest tests/ -v                                   # unit tests
 ```
+
+### Docker
+
+```bash
+docker build -t rabobank-rag .
+docker run -p 8000:8000 \
+  -e AZURE_OPENAI_API_KEY=... \
+  -e AZURE_OPENAI_ENDPOINT=https://... \
+  -e API_KEY=<your-shared-secret> \
+  rabobank-rag
+```
+
+The image builds the index at container build time, so the container starts in <2 seconds. The healthcheck `/health` is wired for orchestration.
 
 ## API
 
-**POST /query**
+**GET /health** → `{"status": "ok"}` (unauthenticated, for load balancer probes)
+
+**POST /query** — authenticated if `API_KEY` env var is set, open otherwise (with startup warning).
+
+Request:
 ```json
 {"question": "What role did CDOs play in the 2008 crisis?"}
+```
+
+Headers (if API_KEY is set):
+```
+X-API-Key: <your-shared-secret>
 ```
 
 Response:
 ```json
 {
-  "answer": "CDOs played a significant role... [subprime_mortgage_crisis#0124] ...",
+  "question": "...",
+  "answer": "...with [subprime_mortgage_crisis#0124] inline citations",
   "retrieved_chunks": ["subprime_mortgage_crisis#0124", "..."],
-  "latency_ms": 2710.1
+  "model": "gpt-4o-mini",
+  "latency_ms": 2710.1,
+  "request_id": "a1b2c3d4e5f6"
 }
 ```
 
-**GET /health** → `{"status": "ok"}`
+Content-filter rejections return 422 with a clear message. Every request gets a `request_id` in both response body and structured logs for cross-system tracing.
 
-Swagger auto-docs at `/docs` — frontend devs can explore the contract without reading code.
+Swagger auto-docs at `/docs`.
+
+## Tests
+
+```bash
+pytest tests/ -v
+```
+
+9 unit tests on pure functions (context_recall). LLM-as-judge paths (faithfulness, correctness) are tested via the integration eval harness since they are stochastic and require API credentials. Contract tests on the FastAPI endpoints are listed as Layer 2 work.
 
 ## Decisions (chose / rejected / production)
 
@@ -104,6 +133,12 @@ Swagger auto-docs at `/docs` — frontend devs can explore the contract without 
 **5. Grounded prompt, inline citation enforcement.** Model must cite chunk IDs inline. Rejected: free-form generation, citations appended at end (decorative). Production: add an output-side faithfulness classifier gating the response before return.
 
 **6. Evaluation: context recall, faithfulness, answer correctness.** Three metrics, hand-labelled QA set. Rejected: BLEU/ROUGE (wrong for generative QA), LLM-as-judge without gold answers (unreliable). Production: 4-tier eval strategy (golden / gating / adversarial / online).
+
+**7. Shared-secret API key for `/query`.** Chose header-based `X-API-Key` as a minimal auth stub so the service cannot be called anonymously in an internal network. Rejected: OAuth2 (too much setup for 2h), no auth (unacceptable even in an assessment). Production: **managed identity** for service-to-service calls, Azure AD user auth for interactive use, RBAC at the Azure AI Search layer for data access.
+
+**8. Structured JSON-friendly logging with per-request UUID.** Every `/query` generates a `request_id` returned in the response body and in logs, so a support engineer can trace an incident across services. Rejected: no logging (compliance gap), print statements (unstructured). Production: Azure Application Insights with custom dimensions and distributed-tracing span IDs.
+
+**9. Docker image with build-time index.** `Dockerfile` builds `data/processed/faiss.index` at image build, so the container starts in <2s and is reproducible. Rejected: runtime indexing (cold-start penalty), bundled index in git (bloats history). Production: index built once, pushed to Azure AI Search, container is stateless.
 
 ## Evaluation
 
@@ -219,8 +254,11 @@ The scores look high. I want to flag the caveats explicitly.
 
 Honest accounting so the reflection call starts from shared ground:
 
-- **Single-document corpus.** Multi-document retrieval would add meaningful cross-document failure modes (topic collision, source attribution, per-document ranking). Single-doc was the right scope for 2 hours but is not a production test.
-- **No human evaluation on any sample.** Every metric above uses LLM-as-judge. Inter-rater agreement with humans is Layer 2 work.
-- **No online evaluation / user feedback loop.** The API returns answers and chunk IDs; a production deployment would log thumbs-up/down, sample for human review, feed disagreements back into the golden set.
+- **Single-document corpus.** Multi-document retrieval would add cross-document failure modes (topic collision, source attribution, per-document ranking). Single-doc was correct scope for 2 hours; not a production test.
+- **No human evaluation on any sample.** Every metric uses LLM-as-judge. Inter-rater agreement with humans is Layer 2 work.
+- **No online evaluation / user-feedback loop.** A production deployment would log thumbs-up/down, sample for human review, feed disagreements back into the golden set.
 - **No retrieval-metric alternative.** I diagnosed the MMR-vs-chunk-ID-match issue but did not swap the metric. Adding precision@k against relevant/not-relevant labels would take ~15 minutes.
+- **Unit tests are shallow.** 9 pure-function tests; no FastAPI contract tests, no golden-set regression tests in CI, no Hypothesis property tests.
+- **No token-cost tracking in the response.** Latency is tracked, cost is not. Trivial addition (`response.usage.total_tokens × price`).
+- **No streaming response.** Long answers block until complete. Server-Sent Events would improve UX for multi-sentence answers.
 - **Decision log written alongside results, not alongside code.** In production I'd commit ADRs per change, not all at once.
