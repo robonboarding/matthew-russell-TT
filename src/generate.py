@@ -49,6 +49,22 @@ Context:
 Answer (with inline [chunk_id] citations):"""
 
 
+# GPT-4o-mini pricing (USD per 1M tokens) as of 2026-04.
+# Pricing is configurable via env; hardcoded here as a sensible default so cost
+# tracking is never silently wrong. In production these would come from a
+# pricing service so changes propagate without a redeploy.
+PRICE_PER_M_INPUT_USD = 0.15
+PRICE_PER_M_OUTPUT_USD = 0.60
+
+
+def compute_cost_usd(input_tokens: int, output_tokens: int) -> float:
+    return round(
+        (input_tokens / 1_000_000) * PRICE_PER_M_INPUT_USD
+        + (output_tokens / 1_000_000) * PRICE_PER_M_OUTPUT_USD,
+        6,
+    )
+
+
 @dataclass
 class GenerationResult:
     question: str
@@ -56,6 +72,9 @@ class GenerationResult:
     retrieved_chunks: list[str]
     model: str
     timestamp: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
 
 
 def format_context(results: Sequence[RetrievalResult]) -> str:
@@ -74,6 +93,9 @@ def generate(question: str) -> GenerationResult:
     """Retrieve, generate, log."""
     results = retrieve(question)
 
+    input_tokens = 0
+    output_tokens = 0
+
     if not results:
         answer = "I cannot answer this from the available documents."
     else:
@@ -87,6 +109,12 @@ def generate(question: str) -> GenerationResult:
             ],
         )
         answer = response.choices[0].message.content or ""
+        # Capture usage for cost tracking. Defensive against SDK evolution:
+        # fall back to zero rather than crash if fields move.
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+            output_tokens = getattr(usage, "completion_tokens", 0) or 0
 
     result = GenerationResult(
         question=question,
@@ -94,6 +122,9 @@ def generate(question: str) -> GenerationResult:
         retrieved_chunks=[r.chunk.chunk_id for r in results],
         model=CONFIG.chat_deployment,
         timestamp=datetime.now(timezone.utc).isoformat(),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_usd=compute_cost_usd(input_tokens, output_tokens),
     )
     log_generation(result)
     return result

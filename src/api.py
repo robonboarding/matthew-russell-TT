@@ -59,6 +59,9 @@ class QueryResponse(BaseModel):
     model: str
     latency_ms: float
     request_id: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
 
 
 @app.get("/health")
@@ -85,8 +88,10 @@ def query(req: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
     latency_ms = round((time.perf_counter() - start) * 1000, 1)
     logger.info(
-        "query response request_id=%s latency_ms=%.1f chunks=%d",
+        "query response request_id=%s latency_ms=%.1f chunks=%d "
+        "input_tokens=%d output_tokens=%d cost_usd=%.5f",
         request_id, latency_ms, len(result.retrieved_chunks),
+        result.input_tokens, result.output_tokens, result.cost_usd,
     )
     return QueryResponse(
         question=result.question,
@@ -95,4 +100,7 @@ def query(req: QueryRequest) -> QueryResponse:
         model=result.model,
         latency_ms=latency_ms,
         request_id=request_id,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        cost_usd=result.cost_usd,
     )

@@ -25,6 +25,7 @@ In production at Rabobank:
 """
 
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,18 +55,21 @@ ANSWER:
 
 Respond with a JSON object: {{"faithful": true|false, "unsupported_claims": [list of strings]}}"""
 
-CORRECTNESS_PROMPT = """You are evaluating whether a PREDICTED ANSWER correctly answers the QUESTION, using the GOLD ANSWER as reference.
+CORRECTNESS_PROMPT = """You are evaluating whether a PREDICTED ANSWER correctly answers the QUESTION, using the GOLD ANSWER as a reference for what a good answer looks like.
 
 QUESTION: {question}
 GOLD ANSWER: {gold}
 PREDICTED ANSWER: {predicted}
 
-Score from 0.0 to 1.0 where:
-1.0 = fully correct and complete
-0.5 = partially correct or incomplete
-0.0 = incorrect or missing
+Score on fact coverage, not phrasing:
 
-Respond with a JSON object: {{"score": float, "reasoning": "short explanation"}}"""
+1.0 = The predicted answer asserts the key facts from the gold, or provides an equally valid alternative grounded in the question. Different wording, additional true facts, or extra context does NOT lower the score. Missing only minor detail is acceptable.
+0.5 = The predicted answer is directionally correct but is missing one or more key facts from the gold (or contains a factual error on a minor point).
+0.0 = The predicted answer is incorrect, contradicts the gold, or is substantially missing.
+
+Be lenient on phrasing; strict on factual content. An answer that covers the same facts as the gold in different words should score 1.0, not 0.5.
+
+Respond with a JSON object: {{"score": float, "reasoning": "short explanation of which key facts were present or missing"}}"""
 
 
 @dataclass
@@ -74,9 +78,12 @@ class EvalResult:
     context_recall: float
     faithfulness: float
     answer_correctness: float
+    citation_validity: float
+    refusal_correctness: float
     predicted_answer: str
     retrieved_chunks: list[str]
     expected_chunks: list[str]
+    cost_usd: float
 
 
 def context_recall(retrieved: list[str], expected: list[str]) -> float:
@@ -85,6 +92,56 @@ def context_recall(retrieved: list[str], expected: list[str]) -> float:
         return 1.0
     hits = sum(1 for e in expected if e in retrieved)
     return hits / len(expected)
+
+
+# Matches citation tokens like [subprime_mortgage_crisis#0124] or [lehman_brothers#0030].
+# Intentionally strict so a model inventing a chunk like [fake_doc#9999] is caught.
+_CITATION_RE = re.compile(r"\[([a-zA-Z0-9_\-]+#\d{4})\]")
+
+
+def citation_validity(answer: str, retrieved: list[str]) -> float:
+    """
+    Fraction of cited chunk_ids in the answer that are actually in the
+    retrieved set. Returns 1.0 when the answer contains no citations (the
+    refusal path is legitimately citation-free).
+
+    Catches the specific failure where a model fabricates plausible-looking
+    citations the reader might trust. This check is mechanical, not LLM-based,
+    so it is cheap and deterministic.
+    """
+    cited = _CITATION_RE.findall(answer)
+    if not cited:
+        return 1.0
+    valid = sum(1 for c in cited if c in retrieved)
+    return valid / len(cited)
+
+
+_REFUSAL_MARKERS = (
+    "i cannot answer",
+    "not in the",
+    "do not contain",
+    "does not contain",
+    "no information",
+    "not available in",
+    "outside the",
+    "cannot find",
+)
+
+
+def is_refusal(answer: str) -> bool:
+    """Heuristic: does the answer look like a grounded refusal?"""
+    low = answer.lower()
+    return any(marker in low for marker in _REFUSAL_MARKERS) or answer.strip() == "[BLOCKED BY AZURE CONTENT FILTER]"
+
+
+def refusal_correctness(answer: str, should_refuse: bool) -> float:
+    """
+    1.0 if the system refused when it should, or answered when it should not refuse.
+    0.0 otherwise. A symmetric metric: over-refusal (false negative on valid query)
+    is as bad as under-refusal (leaking training-data answers on out-of-scope).
+    """
+    refused = is_refusal(answer)
+    return 1.0 if refused == should_refuse else 0.0
 
 
 def judge_faithfulness(context: str, answer: str) -> float:
@@ -161,16 +218,29 @@ def run_eval(eval_path: Path = EVAL_PATH) -> list[EvalResult]:
             else:
                 raise
 
+        # Determine whether refusal is the correct behaviour for this question.
+        # Categories "refusal" and "prompt_injection" should refuse. Explicit
+        # `must_refuse: true` in JSON overrides either way.
+        category = item.get("category", "")
+        should_refuse = item.get(
+            "must_refuse", category in {"refusal", "prompt_injection"}
+        )
+
         # Metrics
         recall = context_recall(retrieved_ids, expected_chunks)
+        cite_validity = citation_validity(predicted, retrieved_ids)
+        refusal_ok = refusal_correctness(predicted, should_refuse)
+
         if filter_tripped:
             # Provider-layer refusal is, by design, faithful and correct for an
-            # injection attempt. Score both at 1.0 and surface the filter event.
+            # injection attempt. Score faith+correct 1.0 and surface the filter.
             faith = 1.0
             correct = 1.0
         else:
             faith = judge_faithfulness(context, predicted) if retrieval_results else 0.0
             correct = judge_correctness(question, gold, predicted)
+
+        cost_usd = 0.0 if filter_tripped else getattr(gen, "cost_usd", 0.0)
 
         results.append(
             EvalResult(
@@ -178,15 +248,22 @@ def run_eval(eval_path: Path = EVAL_PATH) -> list[EvalResult]:
                 context_recall=recall,
                 faithfulness=faith,
                 answer_correctness=correct,
+                citation_validity=cite_validity,
+                refusal_correctness=refusal_ok,
                 predicted_answer=predicted,
                 retrieved_chunks=retrieved_ids,
                 expected_chunks=expected_chunks,
+                cost_usd=cost_usd,
             )
         )
 
-        print(f"\nQ: {question}")
         flag = "  [FILTER]" if filter_tripped else ""
-        print(f"  context_recall={recall:.2f}  faithfulness={faith:.2f}  correctness={correct:.2f}{flag}")
+        print(f"\nQ: {question}")
+        print(
+            f"  recall={recall:.2f}  faith={faith:.2f}  correct={correct:.2f}  "
+            f"cite_valid={cite_validity:.2f}  refusal={refusal_ok:.2f}  "
+            f"cost=${cost_usd:.5f}{flag}"
+        )
 
     return results
 
@@ -196,14 +273,17 @@ def summarise(results: list[EvalResult]) -> None:
     if n == 0:
         print("No results.")
         return
-    avg_recall = sum(r.context_recall for r in results) / n
-    avg_faith = sum(r.faithfulness for r in results) / n
-    avg_correct = sum(r.answer_correctness for r in results) / n
+    avg = lambda attr: sum(getattr(r, attr) for r in results) / n
+    total_cost = sum(r.cost_usd for r in results)
     print("\n" + "=" * 60)
     print(f"Evaluated {n} questions")
-    print(f"  Avg context recall:    {avg_recall:.2f}")
-    print(f"  Avg faithfulness:      {avg_faith:.2f}")
-    print(f"  Avg answer correctness: {avg_correct:.2f}")
+    print(f"  Avg context recall:     {avg('context_recall'):.2f}")
+    print(f"  Avg faithfulness:       {avg('faithfulness'):.2f}")
+    print(f"  Avg answer correctness: {avg('answer_correctness'):.2f}")
+    print(f"  Avg citation validity:  {avg('citation_validity'):.2f}")
+    print(f"  Avg refusal correctness:{avg('refusal_correctness'):.2f}")
+    print(f"  Total cost (USD):       ${total_cost:.5f} ({n} questions)")
+    print(f"  Avg cost per query:     ${total_cost / n:.5f}")
     print("=" * 60)
 
 

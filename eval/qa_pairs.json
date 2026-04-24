@@ -55,5 +55,26 @@
     "question": "What happened in 2008?",
     "gold_answer": "The 2008 financial crisis was triggered by the collapse of the subprime mortgage market, causing a severe economic recession, widespread unemployment, and government interventions including TARP.",
     "expected_chunks": []
+  },
+  {
+    "id": "q9",
+    "category": "cross_document",
+    "question": "How did the collapse of Lehman Brothers relate to subprime mortgage lending?",
+    "gold_answer": "Lehman Brothers held significant exposure to mortgage-backed securities tied to subprime loans. When subprime defaults surged and asset values collapsed, Lehman was unable to refinance its short-term obligations and filed for bankruptcy in September 2008 — the largest in US history.",
+    "expected_chunks": []
+  },
+  {
+    "id": "q10",
+    "category": "cross_document",
+    "question": "How did credit default swaps amplify losses during the subprime mortgage crisis?",
+    "gold_answer": "Credit default swaps allowed multiple parties to bet against the same mortgage-backed securities without owning them, so losses compounded beyond the face value of the underlying loans. The interconnected web of CDS obligations meant that institution failures like Lehman propagated losses across counterparties, amplifying systemic risk.",
+    "expected_chunks": []
+  },
+  {
+    "id": "q11",
+    "category": "single_doc_lehman",
+    "question": "What was Lehman Brothers' primary business before its bankruptcy?",
+    "gold_answer": "Lehman Brothers was a global financial services firm specialising in investment banking, trading, investment management, and private banking. It was the fourth-largest US investment bank before its 2008 collapse.",
+    "expected_chunks": []
   }
 ]

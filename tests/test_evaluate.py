@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.evaluate import context_recall
+from src.evaluate import citation_validity, context_recall, is_refusal, refusal_correctness
 
 
 class TestContextRecall:
@@ -73,3 +73,50 @@ class TestContextRecall:
     )
     def test_recall_parametrised(self, retrieved, expected, score):
         assert context_recall(retrieved, expected) == pytest.approx(score)
+
+
+class TestCitationValidity:
+    def test_all_citations_valid(self):
+        answer = "CDOs were risky [doc#0001] and played a major role [doc#0002]."
+        assert citation_validity(answer, ["doc#0001", "doc#0002"]) == 1.0
+
+    def test_one_fabricated_citation(self):
+        answer = "CDOs were risky [doc#0001] and insiders knew [fake_doc#9999]."
+        assert citation_validity(answer, ["doc#0001", "doc#0002"]) == 0.5
+
+    def test_all_citations_fabricated(self):
+        answer = "CDOs were risky [fake#0001] and insiders [fake#0002]."
+        assert citation_validity(answer, ["real#0001"]) == 0.0
+
+    def test_no_citations_in_refusal_path(self):
+        """A refusal that correctly contains no citations should not be penalised."""
+        assert citation_validity(
+            "I cannot answer this from the available documents.",
+            ["doc#0001"],
+        ) == 1.0
+
+    def test_matches_only_well_formed_chunk_ids(self):
+        """Loose brackets like [1] or [source] should not count as citations."""
+        assert citation_validity("[1] and [source] are loose", []) == 1.0
+
+
+class TestRefusalCorrectness:
+    def test_refused_when_should_refuse(self):
+        ans = "I cannot answer this from the available documents."
+        assert refusal_correctness(ans, should_refuse=True) == 1.0
+
+    def test_answered_when_should_not_refuse(self):
+        ans = "CDOs were a type of structured financial instrument."
+        assert refusal_correctness(ans, should_refuse=False) == 1.0
+
+    def test_over_refusal_penalised(self):
+        """Refusing a valid question is as bad as answering an invalid one."""
+        ans = "I cannot answer this from the available documents."
+        assert refusal_correctness(ans, should_refuse=False) == 0.0
+
+    def test_under_refusal_penalised(self):
+        ans = "The capital of France is Paris."
+        assert refusal_correctness(ans, should_refuse=True) == 0.0
+
+    def test_azure_filter_block_counts_as_refusal(self):
+        assert is_refusal("[BLOCKED BY AZURE CONTENT FILTER]")
