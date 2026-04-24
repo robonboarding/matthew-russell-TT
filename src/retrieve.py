@@ -100,9 +100,19 @@ def mmr_rerank(
     return [candidate_indices[i] for i in selected]
 
 
-def retrieve(query: str, top_k: int | None = None, retrieve_k: int | None = None) -> list[RetrievalResult]:
+def retrieve(
+    query: str,
+    top_k: int | None = None,
+    retrieve_k: int | None = None,
+    use_mmr: bool = True,
+) -> list[RetrievalResult]:
     """
-    End-to-end retrieval: embed query, search index, rerank with MMR.
+    End-to-end retrieval: embed query, search index, optionally rerank with MMR.
+
+    use_mmr=False returns the top_k nearest neighbours directly (baseline).
+    use_mmr=True over-retrieves retrieve_k candidates then reranks to top_k
+    using Maximum Marginal Relevance, trading a small amount of relevance
+    for diversity across near-duplicate chunks.
     """
     top_k = top_k or CONFIG.top_k
     retrieve_k = retrieve_k or CONFIG.retrieve_k
@@ -110,26 +120,27 @@ def retrieve(query: str, top_k: int | None = None, retrieve_k: int | None = None
     index, chunks = load_index()
     query_vec = embed_query(query)
 
-    # Initial dense search
-    distances, indices = index.search(query_vec.reshape(1, -1), retrieve_k)
+    search_k = retrieve_k if use_mmr else top_k
+    distances, indices = index.search(query_vec.reshape(1, -1), search_k)
     candidate_indices = [int(i) for i in indices[0] if i >= 0]
     candidate_distances = [float(d) for d in distances[0][: len(candidate_indices)]]
 
     if not candidate_indices:
         return []
 
-    # Reconstruct candidate vectors from the index for MMR
-    candidate_vecs = np.vstack([index.reconstruct(i) for i in candidate_indices])
+    if use_mmr:
+        candidate_vecs = np.vstack([index.reconstruct(i) for i in candidate_indices])
+        reranked_indices = mmr_rerank(query_vec, candidate_vecs, candidate_indices, top_k)
+        distance_map = dict(zip(candidate_indices, candidate_distances))
+        return [
+            RetrievalResult(chunk=chunks[idx], distance=distance_map[idx], rank=rank)
+            for rank, idx in enumerate(reranked_indices)
+        ]
 
-    reranked_indices = mmr_rerank(query_vec, candidate_vecs, candidate_indices, top_k)
-
-    # Map back to distances (use original distance from initial search)
-    distance_map = dict(zip(candidate_indices, candidate_distances))
-    results = [
-        RetrievalResult(chunk=chunks[idx], distance=distance_map[idx], rank=rank)
-        for rank, idx in enumerate(reranked_indices)
+    return [
+        RetrievalResult(chunk=chunks[idx], distance=dist, rank=rank)
+        for rank, (idx, dist) in enumerate(zip(candidate_indices, candidate_distances))
     ]
-    return results
 
 
 if __name__ == "__main__":
